@@ -1,0 +1,398 @@
+﻿from __future__ import annotations
+from leaf_validator import validate_leaf
+
+import json
+import os
+import sqlite3
+from io import BytesIO
+from pathlib import Path
+from datetime import datetime
+
+import torch
+from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi.middleware.cors import CORSMiddleware
+from PIL import Image
+from torchvision import models, transforms
+
+from agrivision_integrations import install_integrations
+
+# ============================================================
+# PATHS
+# ============================================================
+BASE_DIR = Path(__file__).resolve().parent
+PROJECT_DIR = BASE_DIR.parent
+
+MODEL_CANDIDATES = [
+    BASE_DIR / "trained_model" / "mobilenetv3_plantvillage.pth",
+    PROJECT_DIR / "trained_model" / "mobilenetv3_plantvillage.pth",
+    BASE_DIR / "models" / "mobilenetv3_plantvillage.pth",
+    PROJECT_DIR / "models" / "mobilenetv3_plantvillage.pth",
+]
+
+CLASS_NAMES_CANDIDATES = [
+    BASE_DIR / "trained_model" / "class_names.json",
+    PROJECT_DIR / "trained_model" / "class_names.json",
+    BASE_DIR / "class_names.json",
+    PROJECT_DIR / "class_names.json",
+]
+
+DB_PATH = BASE_DIR / "agrivision.db"
+
+# ============================================================
+# APP
+# ============================================================
+app = FastAPI(
+    title="AgriVision AI",
+    description="Crop disease detection with Grad-CAM++, NASA POWER and SoilGrids.",
+    version="2.0.0",
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# ============================================================
+# CLASS NAMES
+# ============================================================
+def find_existing(paths: list[Path], description: str) -> Path:
+    for path in paths:
+        if path.exists():
+            return path
+    checked = "\n".join(f" - {p}" for p in paths)
+    raise FileNotFoundError(
+        f"{description} not found. Checked:\n{checked}"
+    )
+
+
+CLASS_NAMES_PATH = find_existing(CLASS_NAMES_CANDIDATES, "class_names.json")
+CLASS_NAMES = json.loads(CLASS_NAMES_PATH.read_text(encoding="utf-8"))
+
+if isinstance(CLASS_NAMES, dict):
+    CLASS_NAMES = [CLASS_NAMES[str(i)] if str(i) in CLASS_NAMES else CLASS_NAMES[i] for i in range(len(CLASS_NAMES))]
+
+# ============================================================
+# DATABASE
+# ============================================================
+def init_database() -> None:
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS predictions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                filename TEXT NOT NULL,
+                prediction TEXT NOT NULL,
+                confidence REAL NOT NULL,
+                crop TEXT,
+                status TEXT,
+                temperature REAL,
+                humidity REAL,
+                precipitation REAL,
+                wind_speed REAL,
+                latitude REAL,
+                longitude REAL,
+                created_at TEXT NOT NULL
+            )
+            """
+        )
+        conn.commit()
+
+
+init_database()
+
+# ============================================================
+# MODEL
+# ============================================================
+IMAGE_SIZE = 224
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+transform = transforms.Compose(
+    [
+        transforms.Resize((IMAGE_SIZE, IMAGE_SIZE)),
+        transforms.ToTensor(),
+        transforms.Normalize(
+            mean=[0.485, 0.456, 0.406],
+            std=[0.229, 0.224, 0.225],
+        ),
+    ]
+)
+
+MODEL_PATH = find_existing(MODEL_CANDIDATES, "MobileNetV3 model file")
+
+model = models.mobilenet_v3_small(weights=None)
+model.classifier[3] = torch.nn.Linear(
+    model.classifier[3].in_features,
+    len(CLASS_NAMES),
+)
+
+checkpoint = torch.load(
+    MODEL_PATH,
+    map_location=device,
+    weights_only=False,
+)
+
+if isinstance(checkpoint, dict):
+    if "model_state_dict" in checkpoint:
+        state_dict = checkpoint["model_state_dict"]
+    elif "state_dict" in checkpoint:
+        state_dict = checkpoint["state_dict"]
+    else:
+        state_dict = checkpoint
+else:
+    state_dict = checkpoint
+
+# Handle checkpoints saved through DataParallel.
+state_dict = {
+    (key[7:] if key.startswith("module.") else key): value
+    for key, value in state_dict.items()
+}
+
+model.load_state_dict(state_dict, strict=True)
+model.to(device)
+model.eval()
+
+# ============================================================
+# DISEASE INFORMATION
+# ============================================================
+DISEASE_INFO = {
+    "Tomato___healthy": {
+        "crop": "Tomato",
+        "status": "Healthy",
+        "description": "The tomato leaf appears healthy according to the AI model.",
+        "advice": "Continue regular monitoring, proper irrigation, nutrition and good field hygiene."
+    },
+    "Tomato___Early_blight": {
+        "crop": "Tomato",
+        "status": "Disease Detected",
+        "description": "The model detected characteristics associated with tomato early blight.",
+        "advice": "Remove heavily affected leaves, avoid overhead irrigation and maintain good airflow."
+    },
+    "Tomato___Late_blight": {
+        "crop": "Tomato",
+        "status": "Disease Detected",
+        "description": "The model detected characteristics associated with tomato late blight.",
+        "advice": "Monitor the crop closely, remove affected plant material and avoid prolonged leaf wetness."
+    },
+    "Tomato___Tomato_Yellow_Leaf_Curl_Virus": {
+        "crop": "Tomato",
+        "status": "Disease Detected",
+        "description": "The model detected characteristics associated with Tomato Yellow Leaf Curl Virus.",
+        "advice": "Inspect plants for whitefly activity and isolate severely affected plants where appropriate."
+    },
+    "Potato___healthy": {
+        "crop": "Potato",
+        "status": "Healthy",
+        "description": "The potato leaf appears healthy according to the AI model.",
+        "advice": "Continue regular crop monitoring and maintain balanced irrigation and nutrition."
+    },
+    "Potato___Early_blight": {
+        "crop": "Potato",
+        "status": "Disease Detected",
+        "description": "The model detected characteristics associated with potato early blight.",
+        "advice": "Remove affected foliage where practical and maintain good field sanitation."
+    },
+    "Potato___Late_blight": {
+        "crop": "Potato",
+        "status": "Disease Detected",
+        "description": "The model detected characteristics associated with potato late blight.",
+        "advice": "Monitor closely during humid conditions and seek local agricultural guidance for treatment."
+    },
+    "Corn_(maize)___healthy": {
+        "crop": "Corn (Maize)",
+        "status": "Healthy",
+        "description": "The corn leaf appears healthy according to the AI model.",
+        "advice": "Continue regular monitoring and maintain appropriate irrigation and nutrition."
+    },
+    "Corn_(maize)___Northern_Leaf_Blight": {
+        "crop": "Corn (Maize)",
+        "status": "Disease Detected",
+        "description": "The model detected characteristics associated with Northern Leaf Blight.",
+        "advice": "Monitor nearby plants and maintain field sanitation. Consider local agricultural advice if symptoms spread."
+    },
+    "Corn_(maize)___Common_rust_": {
+        "crop": "Corn (Maize)",
+        "status": "Disease Detected",
+        "description": "The model detected characteristics associated with common rust.",
+        "advice": "Inspect surrounding plants and monitor disease progression, especially under favorable humid conditions."
+    },
+    "Apple___healthy": {
+        "crop": "Apple",
+        "status": "Healthy",
+        "description": "The apple leaf appears healthy according to the AI model.",
+        "advice": "Continue routine orchard monitoring and maintain good plant nutrition."
+    },
+    "Apple___Apple_scab": {
+        "crop": "Apple",
+        "status": "Disease Detected",
+        "description": "The model detected characteristics associated with apple scab.",
+        "advice": "Remove infected plant material where practical and monitor the orchard during wet conditions."
+    },
+    "Apple___Black_rot": {
+        "crop": "Apple",
+        "status": "Disease Detected",
+        "description": "The model detected characteristics associated with apple black rot.",
+        "advice": "Remove affected plant material and maintain orchard sanitation."
+    },
+    "Grape___healthy": {
+        "crop": "Grape",
+        "status": "Healthy",
+        "description": "The grape leaf appears healthy according to the AI model.",
+        "advice": "Continue routine vineyard monitoring and maintain suitable irrigation and nutrition."
+    },
+    "Grape___Black_rot": {
+        "crop": "Grape",
+        "status": "Disease Detected",
+        "description": "The model detected characteristics associated with grape black rot.",
+        "advice": "Remove affected material and monitor the vineyard carefully during humid or wet conditions."
+    },
+    "Grape___Esca_(Black_Measles)": {
+        "crop": "Grape",
+        "status": "Disease Detected",
+        "description": "The model detected characteristics associated with grape Esca (Black Measles).",
+        "advice": "Monitor affected vines and consult a local agricultural expert for management recommendations."
+    },
+    "Pepper,_bell___healthy": {
+        "crop": "Bell Pepper",
+        "status": "Healthy",
+        "description": "The pepper leaf appears healthy according to the AI model.",
+        "advice": "Continue regular monitoring and maintain appropriate irrigation and nutrition."
+    },
+    "Pepper,_bell___Bacterial_spot": {
+        "crop": "Bell Pepper",
+        "status": "Disease Detected",
+        "description": "The model detected characteristics associated with bacterial spot.",
+        "advice": "Avoid unnecessary leaf wetness, remove severely affected material and maintain field hygiene."
+    }
+}
+
+# ============================================================
+# HELPERS
+# ============================================================
+def get_info(predicted_class: str) -> dict:
+    return DISEASE_INFO.get(
+        predicted_class,
+        {
+            "crop": "Unknown",
+            "status": "Unknown",
+            "description": "No additional information is available.",
+            "advice": "Consult an agricultural expert.",
+        },
+    )
+
+
+# ============================================================
+# ROUTES
+# ============================================================
+@app.get("/")
+def root():
+    return {
+        "success": True,
+        "message": "AgriVision AI backend is running",
+        "model": "MobileNetV3 Small",
+        "classes": len(CLASS_NAMES),
+        "device": str(device),
+    }
+
+
+@app.get("/health")
+def health():
+    return {
+        "success": True,
+        "model_loaded": model is not None,
+        "model_path": str(MODEL_PATH),
+        "class_names_path": str(CLASS_NAMES_PATH),
+        "classes": len(CLASS_NAMES),
+    }
+
+
+@app.get("/model-info")
+def model_info():
+    return {
+        "architecture": "MobileNetV3 Small",
+        "classes": len(CLASS_NAMES),
+        "image_size": IMAGE_SIZE,
+        "device": str(device),
+        "model_path": str(MODEL_PATH),
+        "class_names": CLASS_NAMES,
+    }
+
+
+@app.post("/predict")
+async def predict(file: UploadFile = File(...)):
+    if not file.content_type or not file.content_type.startswith("image/"):
+        raise HTTPException(status_code=400, detail="Please upload a valid image file.")
+
+    try:
+        contents = await file.read()
+        # Validate uploaded image before disease classification
+        leaf_check = validate_leaf(contents)
+        if not leaf_check["valid"]:
+            return {
+                "success": False,
+                "error": "INVALID_IMAGE",
+                "message": leaf_check["message"],
+                "leaf_confidence": leaf_check["leaf_confidence"],
+                "top_category": leaf_check["top_category"],
+            }
+        image = Image.open(BytesIO(contents)).convert("RGB")
+        tensor = transform(image).unsqueeze(0).to(device)
+
+        with torch.inference_mode():
+            logits = model(tensor)
+            probabilities = torch.softmax(logits, dim=1)[0]
+
+        top_values, top_indices = torch.topk(
+            probabilities,
+            min(3, len(CLASS_NAMES)),
+        )
+
+        predicted_index = int(top_indices[0].item())
+        predicted_class = CLASS_NAMES[predicted_index]
+        confidence = float(top_values[0].item())
+
+        top_predictions = [
+            {
+                "class": CLASS_NAMES[int(index.item())],
+                "confidence": round(float(value.item()) * 100, 2),
+            }
+            for value, index in zip(top_values, top_indices)
+        ]
+
+        info = get_info(predicted_class)
+
+        return {
+            "success": True,
+            "filename": file.filename,
+            "prediction": predicted_class,
+            "class_index": predicted_index,
+            "confidence": round(confidence * 100, 2),
+            "crop": info["crop"],
+            "status": info["status"],
+            "description": info["description"],
+            "advice": info["advice"],
+            "top_predictions": top_predictions,
+        }
+
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Prediction failed: {exc}",
+        ) from exc
+
+
+# Install the clean integration endpoints:
+# /gradcampp and /gradcam -> Grad-CAM++
+# /nasa -> NASA POWER
+# /soil -> ISRIC SoilGrids WCS
+install_integrations(
+    app=app,
+    backend_globals={
+        "model": model,
+        "class_names": CLASS_NAMES,
+        "transform": transform,
+    },
+)
+

@@ -1,0 +1,513 @@
+﻿from __future__ import annotations
+
+import base64
+import json
+from datetime import date, timedelta
+from io import BytesIO
+from pathlib import Path
+
+import httpx
+import numpy as np
+import torch
+import torch.nn.functional as F
+import tifffile
+from fastapi import File, UploadFile
+from PIL import Image, ImageOps
+from torchvision import transforms
+
+_STATE: dict = {}
+
+
+def get_model():
+    return _STATE.get("model")
+
+
+def load_class_names():
+    names = _STATE.get("class_names")
+    if names:
+        return names
+
+    base = Path(__file__).resolve().parent
+    candidates = [
+        base / "trained_model" / "class_names.json",
+        base.parent / "trained_model" / "class_names.json",
+        base / "class_names.json",
+        base.parent / "class_names.json",
+    ]
+
+    for path in candidates:
+        if path.exists():
+            try:
+                return json.loads(path.read_text(encoding="utf-8"))
+            except Exception:
+                continue
+
+    raise RuntimeError(
+        "class_names.json could not be loaded. "
+        "Place it beside the model or in the backend folder."
+    )
+
+
+def to_data_url(image: Image.Image) -> str:
+    buf = BytesIO()
+    image.save(buf, format="PNG")
+    return "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode("ascii")
+
+
+def valid_number(value):
+    try:
+        value = float(value)
+        if not np.isfinite(value) or value <= -998:
+            return None
+        return value
+    except (TypeError, ValueError):
+        return None
+
+
+# ============================================================
+# GRAD-CAM++
+# ============================================================
+async def gradcampp(file: UploadFile = File(...)):
+    try:
+        model = get_model()
+        if model is None:
+            raise RuntimeError("Model is not loaded.")
+
+        raw = await file.read()
+        if not raw:
+            raise RuntimeError("Uploaded image is empty.")
+
+        original = Image.open(BytesIO(raw)).convert("RGB")
+        class_names = load_class_names()
+        model.eval()
+
+        device = next(model.parameters()).device
+
+        transform = transforms.Compose(
+            [
+                transforms.Resize((224, 224)),
+                transforms.ToTensor(),
+                transforms.Normalize(
+                    mean=[0.485, 0.456, 0.406],
+                    std=[0.229, 0.224, 0.225],
+                ),
+            ]
+        )
+
+        x = transform(original).unsqueeze(0).to(device)
+
+        if not hasattr(model, "features"):
+            raise RuntimeError("The loaded model has no convolutional features.")
+
+        # Last convolutional feature block of MobileNetV3 Small.
+        target_layer = model.features[-1]
+
+        activations = []
+        gradients = []
+
+        def forward_hook(_module, _inputs, output):
+            activations.append(output)
+
+        def backward_hook(_module, _grad_input, grad_output):
+            if grad_output and grad_output[0] is not None:
+                gradients.append(grad_output[0])
+
+        h1 = target_layer.register_forward_hook(forward_hook)
+        h2 = target_layer.register_full_backward_hook(backward_hook)
+
+        try:
+            model.zero_grad(set_to_none=True)
+            logits = model(x)
+            class_index = int(torch.argmax(logits, dim=1).item())
+            score = logits[0, class_index]
+            score.backward()
+        finally:
+            h1.remove()
+            h2.remove()
+
+        if not activations:
+            raise RuntimeError("Grad-CAM++ activation was not captured.")
+        if not gradients:
+            raise RuntimeError("Grad-CAM++ gradient was not captured.")
+
+        activation = activations[0]
+        gradient = gradients[0]
+
+        # Grad-CAM++ weights.
+        grad2 = gradient.pow(2)
+        grad3 = gradient.pow(3)
+        activation_sum = activation.sum(dim=(2, 3), keepdim=True)
+
+        denominator = (
+            2.0 * grad2
+            + activation_sum * grad3
+            + 1e-8
+        )
+        alpha = grad2 / denominator
+        positive_gradient = F.relu(gradient)
+
+        weights = (alpha * positive_gradient).sum(
+            dim=(2, 3),
+            keepdim=True,
+        )
+
+        cam = (weights * activation).sum(dim=1, keepdim=True)
+        cam = F.relu(cam)
+        cam = F.interpolate(
+            cam,
+            size=(original.height, original.width),
+            mode="bilinear",
+            align_corners=False,
+        )
+
+        cam = cam[0, 0].detach().cpu().numpy()
+        cam -= cam.min()
+        maximum = float(cam.max())
+        if maximum > 1e-8:
+            cam /= maximum
+        else:
+            cam.fill(0)
+
+        gray = Image.fromarray(
+            np.clip(cam * 255, 0, 255).astype(np.uint8),
+            mode="L",
+        )
+        heatmap = ImageOps.colorize(
+            gray,
+            black=(0, 0, 0),
+            white=(255, 0, 0),
+        )
+        overlay = Image.blend(
+            original,
+            heatmap.convert("RGB"),
+            0.45,
+        )
+
+        probabilities = torch.softmax(logits.detach(), dim=1)
+        confidence = float(probabilities[0, class_index].item() * 100)
+
+        if isinstance(class_names, dict):
+            class_name = class_names.get(
+                str(class_index),
+                class_names.get(class_index, str(class_index)),
+            )
+        else:
+            class_name = class_names[class_index]
+
+        return {
+            "success": True,
+            "method": "Grad-CAM++",
+            "class_index": class_index,
+            "class": class_name,
+            "confidence": round(confidence, 2),
+            "original": to_data_url(original),
+            "heatmap": to_data_url(heatmap),
+            "overlay": to_data_url(overlay),
+        }
+
+    except Exception as exc:
+        return {
+            "success": False,
+            "method": "Grad-CAM++",
+            "error": str(exc),
+        }
+
+
+# ============================================================
+# NASA POWER
+# ============================================================
+async def nasa_power(latitude: float, longitude: float):
+    try:
+        end_date = date.today()
+        start_date = end_date - timedelta(days=21)
+        url = "https://power.larc.nasa.gov/api/temporal/daily/point"
+        params = {
+            "parameters": "T2M,RH2M,WS10M,ALLSKY_SFC_SW_DWN,PRECTOTCORR",
+            "community": "AG",
+            "longitude": longitude,
+            "latitude": latitude,
+            "start": start_date.strftime("%Y%m%d"),
+            "end": end_date.strftime("%Y%m%d"),
+            "format": "JSON",
+            "time-standard": "UTC",
+        }
+        async with httpx.AsyncClient(
+            timeout=30.0,
+            follow_redirects=True
+        ) as client:
+            response = await client.get(url, params=params)
+            response.raise_for_status()
+            payload = response.json()
+        parameters = payload.get("properties", {}).get("parameter", {})
+        if not parameters:
+            return {
+                "success": False,
+                "source": "NASA POWER",
+                "error": "NASA returned no parameter data."
+            }
+        series = {
+            "temperature": parameters.get("T2M", {}),
+            "humidity": parameters.get("RH2M", {}),
+            "wind": parameters.get("WS10M", {}),
+            "solar": parameters.get("ALLSKY_SFC_SW_DWN", {}),
+            "precipitation": parameters.get("PRECTOTCORR", {}),
+        }
+        all_dates = sorted(
+            {
+                d
+                for values in series.values()
+                for d in values
+            },
+            reverse=True
+        )
+        chosen_date = None
+        chosen = None
+        for current_date in all_dates:
+            values = {
+                key: valid_number(values.get(current_date))
+                for key, values in series.items()
+            }
+            if any(value is not None for value in values.values()):
+                chosen_date = current_date
+                chosen = values
+                break
+        if chosen_date is None:
+            return {
+                "success": False,
+                "source": "NASA POWER",
+                "error": "No valid NASA daily data was returned."
+            }
+        # Find the latest valid solar-radiation value independently.
+        # NASA may have valid values for other parameters even when
+        # the newest date has an invalid solar value.
+        solar_value = None
+        solar_date = None
+        for current_date in sorted(series["solar"], reverse=True):
+            candidate = valid_number(
+                series["solar"].get(current_date)
+            )
+            if candidate is not None:
+                solar_value = candidate
+                solar_date = current_date
+                break
+        return {
+            "success": True,
+            "source": "NASA POWER",
+            "date": chosen_date,
+            "latitude": latitude,
+            "longitude": longitude,
+            "temperature": (
+                round(chosen["temperature"], 2)
+                if chosen["temperature"] is not None
+                else None
+            ),
+            "humidity": (
+                round(chosen["humidity"], 2)
+                if chosen["humidity"] is not None
+                else None
+            ),
+            "wind_speed": (
+                round(chosen["wind"] * 3.6, 2)
+                if chosen["wind"] is not None
+                else None
+            ),
+            "solar_radiation": (
+                round(solar_value, 2)
+                if solar_value is not None
+                else None
+            ),
+            "solar_date": solar_date,
+            "precipitation": (
+                round(chosen["precipitation"], 2)
+                if chosen["precipitation"] is not None
+                else None
+            ),
+        }
+    except Exception as exc:
+        return {
+            "success": False,
+            "source": "NASA POWER",
+            "error": str(exc)
+        }
+# ============================================================
+# ISRIC SOILGRIDS WCS â€” 0â€“5 cm MEAN
+# ============================================================
+SOIL_LAYERS = {
+    "phh2o": {
+        "map": "phh2o",
+        "coverage": "phh2o_0-5cm_mean",
+        "label": "pH",
+        "factor": 10.0,
+    },
+    "clay": {
+        "map": "clay",
+        "coverage": "clay_0-5cm_mean",
+        "label": "Clay",
+        "factor": 10.0,
+    },
+    "sand": {
+        "map": "sand",
+        "coverage": "sand_0-5cm_mean",
+        "label": "Sand",
+        "factor": 10.0,
+    },
+    "silt": {
+        "map": "silt",
+        "coverage": "silt_0-5cm_mean",
+        "label": "Silt",
+        "factor": 10.0,
+    },
+    "soc": {
+        "map": "soc",
+        "coverage": "soc_0-5cm_mean",
+        "label": "Organic Carbon",
+        "factor": 10.0,
+    },
+}
+
+
+def read_tiff_value(content: bytes):
+    """
+    Read a SoilGrids GeoTIFF safely.
+    Returns:
+        float: valid SoilGrids value
+        None: when the raster contains only NoData/background values
+    """
+    array = np.asarray(
+        tifffile.imread(BytesIO(content)),
+        dtype=np.float64,
+    )
+    # Remove NaN, Inf, and SoilGrids NoData values.
+    valid = array[
+        np.isfinite(array)
+        & (array > -32000)
+        & (array < 100000)
+    ]
+    if valid.size == 0:
+        return None
+    # SoilGrids may return zero/background pixels for locations
+    # where no soil prediction is available.
+    nonzero = valid[np.abs(valid) > 1e-12]
+    if nonzero.size == 0:
+        return None
+    return float(np.median(nonzero))
+
+
+async def soilgrids(latitude: float, longitude: float):
+    url = "https://maps.isric.org/mapserv"
+    delta = 0.005
+
+    xmin = longitude - delta
+    xmax = longitude + delta
+    ymin = latitude - delta
+    ymax = latitude + delta
+
+    properties = {}
+    errors = {}
+
+    async with httpx.AsyncClient(
+        timeout=45.0,
+        follow_redirects=True,
+    ) as client:
+
+        for key, spec in SOIL_LAYERS.items():
+            params = [
+                ("map", f"/map/{spec['map']}.map"),
+                ("SERVICE", "WCS"),
+                ("VERSION", "2.0.1"),
+                ("REQUEST", "GetCoverage"),
+                ("COVERAGEID", spec["coverage"]),
+                ("FORMAT", "GEOTIFF_INT16"),
+                ("SUBSET", f"X({xmin},{xmax})"),
+                ("SUBSET", f"Y({ymin},{ymax})"),
+                (
+                    "SUBSETTINGCRS",
+                    "http://www.opengis.net/def/crs/EPSG/0/4326",
+                ),
+                (
+                    "OUTPUTCRS",
+                    "http://www.opengis.net/def/crs/EPSG/0/4326",
+                ),
+            ]
+
+            try:
+                response = await client.get(url, params=params)
+
+                if response.status_code != 200:
+                    errors[key] = (
+                        f"HTTP {response.status_code}: "
+                        f"{response.text[:250]}"
+                    )
+                    continue
+
+                content_type = response.headers.get("content-type", "").lower()
+                first4 = response.content[:4]
+                is_tiff = (
+                    "tiff" in content_type
+                    or first4 in (b"II*\x00", b"MM\x00*")
+                )
+
+                if not is_tiff:
+                    errors[key] = (
+                        "WCS did not return GeoTIFF: "
+                        f"{response.text[:250]}"
+                    )
+                    continue
+
+                raw_value = read_tiff_value(response.content)
+
+                if raw_value is None:
+                    errors[key] = "No valid raster value returned."
+                    continue
+
+                properties[spec["label"]] = round(
+                    raw_value / spec["factor"],
+                    2,
+                )
+
+            except Exception as exc:
+                errors[key] = str(exc)
+
+    if not properties:
+        return {
+            "success": False,
+            "available": False,
+            "source": "ISRIC SoilGrids WCS",
+            "latitude": latitude,
+            "longitude": longitude,
+            "depth": "0-5cm",
+            "properties": {},
+            "errors": errors,
+        }
+
+    return {
+        "success": True,
+        "available": True,
+        "source": "ISRIC SoilGrids WCS",
+        "latitude": latitude,
+        "longitude": longitude,
+        "depth": "0-5cm",
+        "properties": properties,
+        "errors": errors,
+    }
+
+
+# ============================================================
+# ROUTE INSTALLER
+# ============================================================
+def install_integrations(app, backend_globals):
+    global _STATE
+    _STATE = backend_globals
+
+    remove_paths = {"/gradcam", "/gradcampp", "/nasa", "/soil"}
+    app.router.routes[:] = [
+        route
+        for route in app.router.routes
+        if getattr(route, "path", None) not in remove_paths
+    ]
+
+    app.add_api_route("/gradcampp", gradcampp, methods=["POST"])
+    app.add_api_route("/gradcam", gradcampp, methods=["POST"])
+    app.add_api_route("/nasa", nasa_power, methods=["GET"])
+    app.add_api_route("/soil", soilgrids, methods=["GET"])
+
